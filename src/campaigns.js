@@ -8,11 +8,25 @@ const CHANNELS = ['email', 'sms'];
 const SMS_MAX = 1600;
 const BODY_MAX = 20000;
 
-export function createCampaign(db, valleyId, userId, input = {}) {
+function parseFuture(value) {
+  if (!value) return null;
+  const when = new Date(value);
+  if (Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) {
+    throw new HttpError(400, 'The scheduled time must be in the future.');
+  }
+  return when.toISOString();
+}
+
+// strict = ready to send. Lenient is used for autosaved drafts, which may be half written.
+function parseCampaignInput(db, valleyId, input, { strict }) {
   const name = str(input.name).slice(0, 120);
   const channel = input.channel;
   const subject = str(input.subject).replace(/[\r\n]+/g, ' ').slice(0, 200);
   let body = str(input.body);
+
+  if (strict && !name) throw new HttpError(400, 'Give the campaign a name.');
+  if (!CHANNELS.includes(channel)) throw new HttpError(400, 'Channel must be "email" or "sms".');
+
   // Email campaigns may carry rich HTML from the editor. It is sanitised, and the plain-text part is derived from it.
   let bodyHtml = '';
   if (channel === 'email' && typeof input.body_html === 'string' && input.body_html.trim()) {
@@ -21,12 +35,10 @@ export function createCampaign(db, valleyId, userId, input = {}) {
     body = htmlToText(bodyHtml);
   }
 
-  if (!name) throw new HttpError(400, 'Give the campaign a name.');
-  if (!CHANNELS.includes(channel)) throw new HttpError(400, 'Channel must be "email" or "sms".');
-  if (!body) throw new HttpError(400, 'The message is empty.');
+  if (strict && !body) throw new HttpError(400, 'The message is empty.');
   if (body.length > BODY_MAX) throw new HttpError(400, 'The message is too long.');
   if (channel === 'sms' && body.length > SMS_MAX) throw new HttpError(400, `Text messages are limited to ${SMS_MAX} characters.`);
-  if (channel === 'email' && !subject) throw new HttpError(400, 'Email campaigns need a subject line.');
+  if (strict && channel === 'email' && !subject) throw new HttpError(400, 'Email campaigns need a subject line.');
 
   // A missing or null list_id means "all contacts in the valley". Any other bad value is rejected rather than silently widening the audience.
   let listId = null;
@@ -35,23 +47,63 @@ export function createCampaign(db, valleyId, userId, input = {}) {
     if (!listId) throw new HttpError(400, 'Choose a valid list or "All contacts".');
     assertList(db, listId, valleyId);
   }
+  return { name, channel, subject, body, bodyHtml, listId };
+}
 
-  let scheduledAt = null;
-  if (input.scheduled_at) {
-    const when = new Date(input.scheduled_at);
-    if (Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) {
-      throw new HttpError(400, 'The scheduled time must be in the future.');
-    }
-    scheduledAt = when.toISOString();
-  }
-
+export function createCampaign(db, valleyId, userId, input = {}) {
+  const c = parseCampaignInput(db, valleyId, input, { strict: true });
+  const scheduledAt = parseFuture(input.scheduled_at);
   const info = run(
     db,
     `INSERT INTO campaigns (valley_id, name, channel, subject, body, body_html, list_id, status, scheduled_at, created_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    valleyId, name, channel, subject, body, bodyHtml, listId, scheduledAt ? 'scheduled' : 'draft', scheduledAt, userId ?? null, nowIso(),
+    valleyId, c.name, c.channel, c.subject, c.body, c.bodyHtml, c.listId, scheduledAt ? 'scheduled' : 'draft', scheduledAt, userId ?? null, nowIso(),
   );
   return Number(info.lastInsertRowid);
+}
+
+// Creates or updates a draft. Missing fields keep their saved value, so autosave can send only what changed.
+export function saveDraft(db, valleyId, userId, id, input = {}) {
+  let merged = { channel: 'email', ...input };
+  if (id) {
+    const c = get(db, 'SELECT * FROM campaigns WHERE id = ? AND valley_id = ?', id, valleyId);
+    if (!c) throw new HttpError(404, 'Campaign not found');
+    if (c.status !== 'draft') throw new HttpError(409, 'Only drafts can be edited. Cancel the schedule first.');
+    merged = { name: c.name, channel: c.channel, subject: c.subject, body: c.body, body_html: c.body_html, list_id: c.list_id, ...input };
+  }
+  const c = parseCampaignInput(db, valleyId, merged, { strict: false });
+  if (id) {
+    run(
+      db,
+      `UPDATE campaigns SET name = ?, channel = ?, subject = ?, body = ?, body_html = ?, list_id = ? WHERE id = ? AND status = 'draft'`,
+      c.name, c.channel, c.subject, c.body, c.bodyHtml, c.listId, id,
+    );
+    return id;
+  }
+  const info = run(
+    db,
+    `INSERT INTO campaigns (valley_id, name, channel, subject, body, body_html, list_id, status, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+    valleyId, c.name, c.channel, c.subject, c.body, c.bodyHtml, c.listId, userId ?? null, nowIso(),
+  );
+  return Number(info.lastInsertRowid);
+}
+
+// Drafts can be half written. Sending and scheduling need a complete campaign.
+function assertSendable(c) {
+  if (!c.name) throw new HttpError(400, 'Give the campaign a name.');
+  if (!c.body) throw new HttpError(400, 'The message is empty.');
+  if (c.channel === 'email' && !c.subject) throw new HttpError(400, 'Email campaigns need a subject line.');
+}
+
+export function scheduleCampaign(db, id, when) {
+  const c = get(db, 'SELECT * FROM campaigns WHERE id = ?', id);
+  if (!c) throw new HttpError(404, 'Campaign not found');
+  if (c.status !== 'draft') throw new HttpError(409, 'Only drafts can be scheduled');
+  assertSendable(c);
+  const at = parseFuture(when);
+  if (!at) throw new HttpError(400, 'Pick a date and time to schedule.');
+  run(db, "UPDATE campaigns SET status = 'scheduled', scheduled_at = ? WHERE id = ?", at, id);
 }
 
 export function campaignView(db, id) {
@@ -109,6 +161,7 @@ export function startCampaign(db, id) {
     const campaign = get(db, 'SELECT * FROM campaigns WHERE id = ?', id);
     if (!campaign) throw new HttpError(404, 'Campaign not found');
     if (!['draft', 'scheduled'].includes(campaign.status)) throw new HttpError(409, 'This campaign has already started');
+    assertSendable(campaign);
     prepareRecipients(db, campaign);
     const { n } = get(db, "SELECT COUNT(*) AS n FROM messages WHERE campaign_id = ? AND status = 'pending'", id);
     const ts = nowIso();

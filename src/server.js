@@ -5,6 +5,7 @@ import { bootstrapSuperAdmin } from './auth.js';
 import { createSmsProvider } from './providers/sms.js';
 import { createEmailProvider } from './providers/email.js';
 import { processQueue } from './campaigns.js';
+import { maybeBackup } from './backup.js';
 
 const config = loadConfig();
 const db = openDb(config.dbFile);
@@ -31,3 +32,17 @@ setInterval(() => {
     log: (msg) => console.error(msg),
   }).catch((err) => console.error('queue error:', err));
 }, config.tickMs);
+
+// Automatic backups of the database file. Check hourly, take one when the newest is older than BACKUP_EVERY_HOURS.
+if (config.dbFile !== ':memory:') {
+  const backup = () => {
+    try {
+      const file = maybeBackup(db, { dir: config.backupDir, everyHours: config.backupEveryHours, keep: config.backupKeep });
+      if (file) console.log(`Backup written to ${file}`);
+    } catch (err) {
+      console.error('backup failed:', err.message);
+    }
+  };
+  backup();
+  setInterval(backup, 60 * 60 * 1000).unref();
+}

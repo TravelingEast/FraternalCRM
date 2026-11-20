@@ -114,10 +114,16 @@ export function createEditor({ placeholder = 'Write your message…' } = {}) {
     previewHost.hidden = next !== 'preview';
   }
 
+  const listeners = [];
+  area.addEventListener('input', () => listeners.forEach((fn) => fn()));
+
   const root = el('div', { class: 'editor' }, toolbar, area, previewHost);
   return {
     node: root,
     getHtml: () => area.innerHTML,
+    // Only for HTML the server already sanitised (a saved draft).
+    setHtml: (html) => { area.innerHTML = html; },
+    onChange: (fn) => listeners.push(fn),
     isEmpty: () => !area.textContent.trim() && !area.querySelector('img'),
     focus: () => area.focus(),
     get mode() { return mode; },

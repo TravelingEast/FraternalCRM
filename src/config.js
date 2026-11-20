@@ -6,6 +6,9 @@ export function loadConfig(env = process.env) {
   return {
     port: Number(env.PORT || 3000),
     dbFile: env.DB_FILE || path.join(dataDir, 'fraternal-crm.sqlite'),
+    backupDir: env.BACKUP_DIR || path.join(dataDir, 'backups'),
+    backupEveryHours: Number(env.BACKUP_EVERY_HOURS ?? 24),
+    backupKeep: Number(env.BACKUP_KEEP || 14),
     publicBaseUrl: (env.PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/+$/, ''),
     trustProxy: env.TRUST_PROXY === '1',
     orientName: env.ORIENT_NAME || 'Orient',

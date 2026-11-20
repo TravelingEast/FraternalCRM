@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { testDb, seedValley, fakeProviders } from './helpers.js';
 import { get, run } from '../src/db.js';
 import { upsertContact, addToList } from '../src/contacts.js';
-import { createCampaign, startCampaign, processQueue, renderMessage, campaignView } from '../src/campaigns.js';
+import { createCampaign, startCampaign, processQueue, renderMessage, campaignView, saveDraft, scheduleCampaign } from '../src/campaigns.js';
 import { nowIso } from '../src/util.js';
 
 const PUBLIC = 'https://crm.example.org';
@@ -146,4 +146,42 @@ test('rich HTML from the editor is sanitised, gets a text version, and merge fie
   const msg = fake.email[0];
   assert.match(msg.html, /<h2>Hello &lt;i&gt;Ann&lt;\/i&gt;<\/h2>/, 'merged values are escaped');
   assert.match(msg.html, /href="https:\/\/crm\.example\.org\/unsubscribe\/[^"]+"/, 'unsubscribe merge field works in links');
+});
+
+test('drafts can be saved half written, edited, and only sent once complete', () => {
+  const { db, valley } = setup();
+  const id = saveDraft(db, valley, null, null, { channel: 'email', subject: 'Half' });
+  assert.equal(campaignView(db, id).status, 'draft');
+  assert.throws(() => startCampaign(db, id), /name/);
+  saveDraft(db, valley, null, id, { name: 'Done', body_html: '<p>Hi <b>there</b></p>' });
+  const saved = get(db, 'SELECT subject, body FROM campaigns WHERE id = ?', id);
+  assert.equal(saved.subject, 'Half', 'fields not sent keep their saved value');
+  assert.equal(saved.body, 'Hi there');
+  saveDraft(db, valley, null, id, { body: '', body_html: '' });
+  assert.equal(get(db, 'SELECT body FROM campaigns WHERE id = ?', id).body, '', 'clearing the editor clears the saved text');
+  saveDraft(db, valley, null, id, { body_html: '<p>Final</p>' });
+  assert.equal(startCampaign(db, id).status, 'sending', 'complete drafts can be sent');
+});
+
+test('only drafts can be edited, and drafts of another valley are not reachable', () => {
+  const { db, valley, listId } = setup();
+  const other = seedValley(db, 'Other');
+  const id = createCampaign(db, valley, null, { name: 'Live', channel: 'sms', body: 'b', list_id: listId });
+  startCampaign(db, id);
+  assert.throws(() => saveDraft(db, valley, null, id, { name: 'x' }), /Only drafts/);
+  const draft = saveDraft(db, valley, null, null, { name: 'd', channel: 'sms', body: 'b' });
+  assert.throws(() => saveDraft(db, other, null, draft, { name: 'hijack' }), /not found/);
+});
+
+test('scheduling needs a complete draft and a future time', () => {
+  const { db, valley } = setup();
+  const id = saveDraft(db, valley, null, null, { name: 'S', channel: 'sms', body: '' });
+  const future = new Date(Date.now() + 3600e3).toISOString();
+  assert.throws(() => scheduleCampaign(db, id, future), /empty/);
+  saveDraft(db, valley, null, id, { body: 'Hello' });
+  assert.throws(() => scheduleCampaign(db, id, '2000-01-01'), /future/);
+  assert.throws(() => scheduleCampaign(db, id, ''), /Pick a date/);
+  scheduleCampaign(db, id, future);
+  assert.equal(campaignView(db, id).status, 'scheduled');
+  assert.throws(() => saveDraft(db, valley, null, id, { name: 'x' }), /Only drafts/);
 });
