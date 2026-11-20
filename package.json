@@ -12,7 +12,8 @@
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.js",
-    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js"
+    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js",
+    "admin": "node --disable-warning=ExperimentalWarning scripts/admin.js"
   },
   "dependencies": {
     "express": "^5.3.0",

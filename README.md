@@ -17,11 +17,11 @@ Requires Node 22.13 or newer.
 
 ```
 npm install
-cp .env.example .env     # edit it, then export the variables (or use your process manager)
+cp .env.example .env     # edit it; the app reads it from the folder you start it in
 npm start
 ```
 
-On first start with an empty database, the statewide admin is created from `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD`. Sign in, add valleys under Admin, then add a valley admin for each one.
+On first start with an empty database, the statewide admin is created from `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD`. Put the password in double quotes in `.env`. Those two settings are ignored once any user exists, and the startup log says so. If you cannot sign in, or you want to change a password, run `npm run admin -- you@example.org`. It resets that user's password, or creates a statewide admin if the email is new. Sign in, add valleys under Admin, then add a valley admin for each one.
 
 Run it behind HTTPS (Caddy or nginx), set `PUBLIC_BASE_URL` to the https address and `TRUST_PROXY=1`.
 
