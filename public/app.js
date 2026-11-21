@@ -4,6 +4,7 @@ import { createEditor, MERGE_FIELDS } from './editor.js';
 const root = document.getElementById('app');
 const state = { me: null, valleys: [], valleyId: null, orient: 'Orient' };
 let timer = null;
+let leaveHook = null; // set by a screen that needs to save before the user navigates away
 
 const isSuper = () => state.me?.role === 'super_admin';
 
@@ -241,7 +242,7 @@ async function campaignsPage() {
     el('button', { class: 'primary', onclick: () => { location.hash = '#/campaigns/new'; } }, 'New campaign')),
     el('div', { class: 'table-wrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['Name', 'Type', 'Audience', 'Status', 'Sent', 'When'].map((h) => el('th', {}, h)))),
       el('tbody', {}, campaigns.length ? campaigns.map((c) => el('tr', {},
-        el('td', {}, el('a', { href: `#/campaigns/${c.id}` }, c.name)), el('td', {}, c.channel === 'sms' ? 'Text' : 'Email'),
+        el('td', {}, el('a', { href: c.status === 'draft' ? `#/campaigns/${c.id}/edit` : `#/campaigns/${c.id}` }, c.name || '(untitled draft)')), el('td', {}, c.channel === 'sms' ? 'Text' : 'Email'),
         el('td', {}, c.list_name || 'All contacts'), el('td', {}, el('span', { class: STATUS_PILL[c.status] }, c.status)),
         el('td', {}, c.recipients ? `${c.sent} of ${c.recipients}${c.failed ? `, ${c.failed} failed` : ''}` : ''),
         el('td', {}, fmtDate(c.sent_at || c.scheduled_at || c.created_at)))) : el('tr', {}, el('td', { colspan: 6, class: 'muted' }, 'No campaigns yet.'))))));
@@ -253,60 +254,107 @@ function smsSegments(text) {
   return text.length <= single ? 1 : Math.ceil(text.length / multi);
 }
 
-async function newCampaignPage() {
+// New and edit share one screen. Everything is autosaved to a server-side draft, so it survives a closed tab or another device.
+async function composePage(draftId) {
+  let draft = null;
+  if (draftId) {
+    draft = (await api(`/api/campaigns/${draftId}`)).campaign;
+    if (draft.status !== 'draft') { location.hash = `#/campaigns/${draftId}`; return el('div'); }
+    if (draft.valley_id !== state.valleyId) { state.valleyId = draft.valley_id; remember('frc_valley', state.valleyId); }
+  }
   if (!state.valleyId) return needValley();
   const { lists } = await api(`/api/lists${q()}`);
-  const name = el('input', { required: true, placeholder: 'e.g. December stated meeting' });
-  const subject = el('input', { placeholder: 'Subject line' });
-  const audience = el('select', {}, el('option', { value: '' }, 'All contacts'), lists.map((l) => el('option', { value: l.id }, `${l.name} (${l.members})`)));
+
+  let channel = draft?.channel || 'email';
+  const name = el('input', { required: true, placeholder: 'e.g. December stated meeting', value: draft?.name || '' });
+  const subject = el('input', { placeholder: 'Subject line', value: draft?.subject || '' });
+  const audience = el('select', {}, el('option', { value: '' }, 'All contacts'),
+    lists.map((l) => el('option', { value: l.id, selected: l.id === draft?.list_id }, `${l.name} (${l.members})`)));
   const when = el('input', { type: 'datetime-local' });
   const editor = createEditor();
+  if (draft?.body_html) editor.setHtml(draft.body_html);
   const sms = el('textarea', { placeholder: 'Write your text message', maxlength: 1600 });
+  if (draft && draft.channel === 'sms') sms.value = draft.body;
   const counter = el('div', { class: 'counter' });
-  const smsBox = el('div', { hidden: true }, sms, counter,
+  const status = el('span', { class: 'muted' }, draft ? 'Draft loaded' : 'Not saved yet');
+
+  const smsBox = el('div', { hidden: channel !== 'sms' }, sms, counter,
     el('div', { class: 'row' }, MERGE_FIELDS.filter(([k]) => k !== 'unsubscribe_url').map(([k, label]) => el('button', { type: 'button', onclick: () => {
       const pos = sms.selectionStart ?? sms.value.length; sms.setRangeText(`{{${k}}}`, pos, sms.selectionEnd ?? pos, 'end'); sms.focus(); sms.dispatchEvent(new Event('input'));
     } }, `+ ${label}`))),
     el('p', { class: 'muted' }, '"Reply STOP to opt out." is added to every text automatically.'));
-  const emailBox = el('div', {}, field('Subject', subject), el('div', { class: 'field' }, 'Message', editor.node));
-  sms.addEventListener('input', () => { counter.textContent = `${sms.value.length} characters, about ${smsSegments(sms.value)} text segment${smsSegments(sms.value) === 1 ? '' : 's'}`; });
+  const emailBox = el('div', { hidden: channel !== 'email' }, field('Subject', subject), el('div', { class: 'field' }, 'Message', editor.node));
+  sms.addEventListener('input', () => { const n = smsSegments(sms.value); counter.textContent = `${sms.value.length} characters, about ${n} text segment${n === 1 ? '' : 's'}`; });
   sms.dispatchEvent(new Event('input'));
 
-  let channel = 'email';
-  const radio = (value, label) => el('label', { class: 'check' }, el('input', { type: 'radio', name: 'channel', value, checked: value === channel, onchange: () => {
-    channel = value; emailBox.hidden = value !== 'email'; smsBox.hidden = value !== 'sms'; } }), label);
-
-  async function submit(mode) {
-    const body = { valley_id: state.valleyId, name: name.value, channel, list_id: audience.value || null };
-    if (channel === 'email') {
-      if (editor.isEmpty()) throw new Error('The message is empty.');
-      body.subject = subject.value; body.body_html = editor.getHtml();
-    } else body.body = sms.value;
-    if (mode === 'schedule') {
-      if (!when.value) throw new Error('Pick a date and time to schedule.');
-      body.scheduled_at = new Date(when.value).toISOString();
+  // --- autosave ---
+  let id = draftId ? Number(draftId) : null;
+  let dirty = false;
+  let timer2 = null;
+  let chain = Promise.resolve();
+  const isBlank = () => !name.value.trim() && !subject.value.trim() && editor.isEmpty() && !sms.value.trim();
+  const payload = () => ({
+    valley_id: state.valleyId, name: name.value, channel, subject: subject.value, list_id: audience.value || null,
+    ...(channel === 'email' ? { body: '', body_html: editor.isEmpty() ? '' : editor.getHtml() } : { body: sms.value, body_html: '' }),
+  });
+  async function doSave() {
+    if (!dirty) return;
+    if (!id && isBlank()) { dirty = false; return; }
+    status.textContent = 'Saving…';
+    const body = payload();
+    dirty = false;
+    try {
+      const res = id
+        ? await api(`/api/campaigns/${id}`, { method: 'PATCH', body })
+        : await api('/api/campaigns', { method: 'POST', body: { ...body, draft: true } });
+      if (!id) { id = res.campaign.id; history.replaceState(null, '', `#/campaigns/${id}/edit`); }
+      status.textContent = `Saved ${new Date().toLocaleTimeString([], { timeStyle: 'short' })}`;
+    } catch (err) {
+      dirty = true;
+      status.textContent = `Not saved: ${err.message}`;
+      throw err;
     }
-    if (mode === 'now') {
-      const who = audience.options[audience.selectedIndex].text;
-      if (!confirm(`Send "${name.value}" now to ${who}? People who have not agreed to receive ${channel === 'sms' ? 'texts' : 'email'}, or who opted out, are skipped automatically.`)) return;
-      body.send_now = true;
-    }
-    const { campaign } = await api('/api/campaigns', { method: 'POST', body });
-    location.hash = `#/campaigns/${campaign.id}`;
   }
-  const act = (mode) => () => guard(() => submit(mode));
+  // Saves run one at a time, in order, so a slow save never overwrites a newer one.
+  const save = () => { clearTimeout(timer2); chain = chain.catch(() => {}).then(doSave); return chain; };
+  const touch = () => {
+    dirty = true; status.textContent = 'Unsaved changes';
+    clearTimeout(timer2); timer2 = setTimeout(() => save().catch(() => {}), 1500);
+  };
+  [name, subject, sms].forEach((n) => n.addEventListener('input', touch));
+  audience.addEventListener('change', touch);
+  editor.onChange(touch);
+  window.onbeforeunload = () => (dirty ? true : undefined);
+  leaveHook = async () => { try { await save(); } catch { /* status line already shows the error */ } };
 
-  return el('div', {}, el('h1', {}, 'New campaign'),
+  const radio = (value, label) => el('label', { class: 'check' }, el('input', { type: 'radio', name: 'channel', value, checked: value === channel, onchange: () => {
+    channel = value; emailBox.hidden = value !== 'email'; smsBox.hidden = value !== 'sms'; touch(); } }), label);
+
+  const leaveTo = (hash) => { dirty = false; leaveHook = null; location.hash = hash; };
+  const saveNow = async () => { dirty = true; await save(); if (!id) throw new Error('Add a name and a message first.'); };
+
+  return el('div', {}, el('div', { class: 'row', style: 'margin-bottom:12px' }, el('h1', { class: 'grow', style: 'margin:0' }, draftId ? 'Edit draft' : 'New campaign'), status),
     el('div', { class: 'card' },
       field('Name (only you see this)', name),
       el('div', { class: 'row' }, radio('email', 'Email'), radio('sms', 'Text message')),
       field('Send to', audience), emailBox, smsBox,
-      el('p', { class: 'muted' }, 'Insert fields like first name from the editor. They are filled in for each person.'),
+      el('p', { class: 'muted' }, 'Insert fields like first name from the editor. They are filled in for each person. Your work saves automatically.'),
       field('Schedule for later (optional)', when),
       el('div', { class: 'row' },
-        el('button', { onclick: act('draft') }, 'Save draft'),
-        el('button', { onclick: act('schedule') }, 'Schedule'),
-        el('button', { class: 'primary', onclick: act('now') }, 'Send now'))));
+        el('button', { onclick: () => guard(async () => { await saveNow(); toast('Draft saved'); }) }, 'Save draft'),
+        el('button', { onclick: () => guard(async () => {
+          if (!when.value) throw new Error('Pick a date and time to schedule.');
+          await saveNow();
+          await api(`/api/campaigns/${id}/schedule`, { method: 'POST', body: { scheduled_at: new Date(when.value).toISOString() } });
+          leaveTo(`#/campaigns/${id}`);
+        }) }, 'Schedule'),
+        el('button', { class: 'primary', onclick: () => guard(async () => {
+          const who = audience.options[audience.selectedIndex].text;
+          if (!confirm(`Send "${name.value}" now to ${who}? People who have not agreed to receive ${channel === 'sms' ? 'texts' : 'email'}, or who opted out, are skipped automatically.`)) return;
+          await saveNow();
+          await api(`/api/campaigns/${id}/send`, { method: 'POST' });
+          leaveTo(`#/campaigns/${id}`);
+        }) }, 'Send now'))));
 }
 
 async function campaignDetailPage(id) {
@@ -321,12 +369,14 @@ async function campaignDetailPage(id) {
   const canStart = c.status === 'draft' || c.status === 'scheduled';
   if (c.status === 'sending') timer = setInterval(() => guard(render), 5000);
   const page = el('div', {}, el('h1', {}, c.name),
+    c.status === 'scheduled' ? el('div', { class: 'notice' }, 'To change a scheduled campaign, cancel the schedule first. It returns to a draft you can edit.') : null,
     el('p', {}, el('span', { class: STATUS_PILL[c.status] }, c.status), ` ${c.channel === 'sms' ? 'Text message' : 'Email'} to ${c.list_name || 'all contacts'}`,
       c.scheduled_at && c.status === 'scheduled' ? ` · goes out ${fmtDate(c.scheduled_at)}` : ''),
     el('div', { class: 'stats' }, stat(c.counts.sent, 'Sent'), stat(c.counts.pending, 'Waiting'), stat(c.counts.failed, 'Failed'), stat(c.counts.skipped, 'Skipped')),
     el('div', { class: 'card', style: 'margin-top:16px' }, c.channel === 'email' ? el('h2', {}, c.subject) : null,
       c.channel === 'email' && c.body_html ? el('iframe', { sandbox: '', title: 'Message', style: 'width:100%;height:320px;border:1px solid var(--line);background:#fff', srcdoc: c.body_html }) : el('pre', { style: 'white-space:pre-wrap' }, c.body)),
     el('div', { class: 'row', style: 'margin-bottom:16px' },
+      c.status === 'draft' ? el('button', { onclick: () => { location.hash = `#/campaigns/${id}/edit`; } }, 'Edit') : null,
       canStart ? el('button', { class: 'primary', onclick: () => guard(async () => { if (!confirm('Send this campaign now?')) return; await api(`/api/campaigns/${id}/send`, { method: 'POST' }); render(); }) }, 'Send now') : null,
       c.status === 'scheduled' ? el('button', { onclick: () => guard(async () => { await api(`/api/campaigns/${id}/cancel`, { method: 'POST' }); render(); }) }, 'Cancel schedule') : null,
       canStart ? el('button', { class: 'danger', onclick: () => guard(async () => { if (!confirm('Delete this campaign?')) return; await api(`/api/campaigns/${id}`, { method: 'DELETE' }); location.hash = '#/campaigns'; }) }, 'Delete') : null),
@@ -392,15 +442,18 @@ async function adminPage() {
 
 async function render() {
   clearInterval(timer);
+  if (leaveHook) { const hook = leaveHook; leaveHook = null; await hook(); }
+  window.onbeforeunload = null;
   if (!state.me) return loginPage();
   const [path, query = ''] = (location.hash.slice(1) || '/').split('?');
   const params = new URLSearchParams(query);
   const campaignId = /^\/campaigns\/(\d+)$/.exec(path)?.[1];
+  const editId = /^\/campaigns\/(\d+)\/edit$/.exec(path)?.[1];
   const routes = {
     '/': dashboardPage, '/contacts': () => contactsPage(params), '/lists': listsPage, '/campaigns': campaignsPage,
-    '/campaigns/new': newCampaignPage, '/connect': connectPage, '/admin': adminPage,
+    '/campaigns/new': () => composePage(null), '/connect': connectPage, '/admin': adminPage,
   };
-  const handler = campaignId ? () => campaignDetailPage(campaignId) : routes[path] || dashboardPage;
+  const handler = editId ? () => composePage(editId) : campaignId ? () => campaignDetailPage(campaignId) : routes[path] || dashboardPage;
   try { shell(await handler()); } catch (err) {
     if (err.status === 401) { state.me = null; return loginPage(); }
     shell(el('div', { class: 'card' }, el('h1', {}, 'Something went wrong'), el('p', {}, err.message)));

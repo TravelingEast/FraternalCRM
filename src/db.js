@@ -118,12 +118,28 @@ CREATE TABLE IF NOT EXISTS consent_log (
 // Values node:sqlite cannot bind: undefined becomes NULL, booleans become 0/1.
 const clean = (v) => (v === undefined ? null : typeof v === 'boolean' ? (v ? 1 : 0) : v);
 
+const SCHEMA_VERSION = 1;
+
+// Upgrades a database created by an older release. Add a step here whenever the schema changes.
+function migrate(db) {
+  const { user_version: version } = db.prepare('PRAGMA user_version').get();
+  if (version > SCHEMA_VERSION) {
+    throw new Error(`This database is from a newer version of the app (schema ${version}). Update the app before opening it.`);
+  }
+  const campaignCols = db.prepare('PRAGMA table_info(campaigns)').all().map((c) => c.name);
+  if (!campaignCols.includes('body_html')) {
+    db.exec("ALTER TABLE campaigns ADD COLUMN body_html TEXT NOT NULL DEFAULT ''");
+  }
+  if (version < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+}
+
 export function openDb(file) {
   if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
 }
 

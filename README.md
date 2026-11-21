@@ -17,17 +17,33 @@ Requires Node 22.13 or newer.
 
 ```
 npm install
-cp .env.example .env     # edit it, then export the variables (or use your process manager)
+cp .env.example .env     # edit it; the app reads it from the folder you start it in
 npm start
 ```
 
-On first start with an empty database, the statewide admin is created from `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD`. Sign in, add valleys under Admin, then add a valley admin for each one.
+On first start with an empty database, the statewide admin is created from `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD`. Put the password in double quotes in `.env`. Those two settings are ignored once any user exists, and the startup log says so. If you cannot sign in, or you want to change a password, run `npm run admin -- you@example.org`. It resets that user's password, or creates a statewide admin if the email is new. Sign in, add valleys under Admin, then add a valley admin for each one.
 
-Data lives in one SQLite file (`DATA_DIR`). Back it up. Run it behind HTTPS (Caddy or nginx), set `PUBLIC_BASE_URL` to the https address and `TRUST_PROXY=1`.
+Run it behind HTTPS (Caddy or nginx), set `PUBLIC_BASE_URL` to the https address and `TRUST_PROXY=1`.
 
 Tests: `npm test`
 
 By default both providers are `console`, which only logs. Nothing leaves the server until you configure real ones.
+
+## Saving your work and your data
+
+**Autosave.** Campaign drafts save to the server about a second and a half after you stop typing. The screen shows "Saved 3:42 PM". Closing the tab, reloading, or switching devices does not lose the message. Leaving the screen saves first. Open any draft from Campaigns to keep editing. A scheduled campaign must be cancelled back to a draft before it can be edited, so a message cannot change after you scheduled it.
+
+**Where data lives.** Everything (contacts, lists, campaigns, delivery history, sign-in sessions, API key hashes) is in one SQLite file at `DATA_DIR/fraternal-crm.sqlite`. Restarting the app loses nothing. What matters is that `DATA_DIR` is on a disk that survives deploys. On a platform with throwaway disks (most container hosts by default) you must attach a persistent volume there, or every deploy starts empty.
+
+**Backups.** The app takes a consistent copy of the database every `BACKUP_EVERY_HOURS` (default 24) into `BACKUP_DIR` (default `DATA_DIR/backups`) and keeps the newest `BACKUP_KEEP` (default 14). Files are readable by the owner only, because they hold contact data and password hashes. Run one by hand with `npm run backup`. Set `BACKUP_EVERY_HOURS=0` to turn the automatic ones off.
+
+By default backups sit on the same disk as the database, which does not protect you from losing that disk. Point `BACKUP_DIR` at a different volume, or copy the folder off the machine on a schedule.
+
+**Restore.** Stop the app, copy a backup file over `DATA_DIR/fraternal-crm.sqlite`, start the app.
+
+**Upgrades.** Older databases are upgraded automatically on start. A database written by a newer version is refused rather than damaged.
+
+**Docker.** A `Dockerfile` is included. Mount a volume at `/data`: `docker run -v crm-data:/data -p 3000:3000 --env-file .env fraternal-crm`. I have not built or run this image, so treat it as a starting point.
 
 ## Texting providers
 
@@ -76,5 +92,6 @@ A campaign with `list_id` omitted or null goes to all contacts in the valley. A 
 - A person in two valleys is two contact records.
 - Failed messages are not retried. If the server dies between handing a message to the provider and recording it, that message can be sent twice.
 - Sending speed is `SMS_PER_TICK` and `EMAIL_PER_TICK` messages every `TICK_MS`. Raise them for large lists, and stay within your provider's rate limits.
+- Autosave covers campaign drafts only. Other forms (adding a contact, import) save when you submit them.
 - No self-service opt-in form, delivery-status webhooks, open or click tracking, or audit log of admin actions yet.
 - Uses Node's built-in SQLite, which Node still labels experimental. Fine for this scale. For many concurrent users, move to Postgres.

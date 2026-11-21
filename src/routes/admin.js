@@ -6,7 +6,7 @@ import {
   loadForUser, publicUser, RateLimiter, requireAuth, requireSuper, resolveValley, setSessionCookie, verifyPassword,
 } from '../auth.js';
 import { addToList, assertList, contactsToCsv, contactWhere, importContacts, logConsent, normalizeEmail, normalizePhone, upsertContact } from '../contacts.js';
-import { campaignView, cancelScheduled, createCampaign, deleteCampaign, startCampaign } from '../campaigns.js';
+import { campaignView, cancelScheduled, createCampaign, deleteCampaign, saveDraft, scheduleCampaign, startCampaign } from '../campaigns.js';
 import { cleanText, flag, nowIso, optionalInt, str } from '../util.js';
 
 const ROLES = ['super_admin', 'valley_admin'];
@@ -380,6 +380,10 @@ export function adminRouter({ db, config }) {
 
   r.post('/campaigns', requireAuth, (req, res) => {
     const valleyId = resolveValley(db, req);
+    if (req.body?.draft === true) {
+      const draftId = saveDraft(db, valleyId, req.user.id, null, req.body);
+      return res.status(201).json({ campaign: campaignView(db, draftId) });
+    }
     const id = createCampaign(db, valleyId, req.user.id, req.body || {});
     if (req.body?.send_now === true) startCampaign(db, id);
     res.status(201).json({ campaign: campaignView(db, id) });
@@ -387,6 +391,19 @@ export function adminRouter({ db, config }) {
 
   r.get('/campaigns/:id', requireAuth, (req, res) => {
     const campaign = loadForUser(db, req, 'campaigns', optionalInt(req.params.id));
+    res.json({ campaign: campaignView(db, campaign.id) });
+  });
+
+  // Autosave target. Only drafts can be edited.
+  r.patch('/campaigns/:id', requireAuth, (req, res) => {
+    const campaign = loadForUser(db, req, 'campaigns', optionalInt(req.params.id));
+    saveDraft(db, campaign.valley_id, req.user.id, campaign.id, req.body || {});
+    res.json({ campaign: campaignView(db, campaign.id) });
+  });
+
+  r.post('/campaigns/:id/schedule', requireAuth, (req, res) => {
+    const campaign = loadForUser(db, req, 'campaigns', optionalInt(req.params.id));
+    scheduleCampaign(db, campaign.id, req.body?.scheduled_at);
     res.json({ campaign: campaignView(db, campaign.id) });
   });
 

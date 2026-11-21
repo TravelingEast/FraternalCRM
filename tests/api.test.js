@@ -183,13 +183,6 @@ test('admin cannot clear an opt-out, but can record one', async () => {
   assert.equal(res.status, 409);
 });
 
-test('login rate limit blocks after repeated failures', async () => {
-  const c = client(env.base);
-  let last;
-  for (let i = 0; i < 11; i++) last = await c.login('nobody@example.org', 'whatever-password');
-  assert.equal(last.status, 429);
-});
-
 test('Twilio signature helper matches the documented algorithm', () => {
   const params = { Body: 'hi', From: '+15550001111' };
   const sig = signTwilio('k', 'https://x.org/hook', params);
@@ -206,3 +199,29 @@ function signTwilio(token, url, params) {
 async function seedContactIn(db, valleyId, email) {
   return Number(db.prepare("INSERT INTO contacts (valley_id, email, unsub_token, created_at, updated_at) VALUES (?, ?, ?, 'n', 'n')").run(valleyId, email, `t-${email}`).lastInsertRowid);
 }
+
+test('autosave flow over HTTP: create draft, patch it, schedule it, and it stops being editable', async () => {
+  const alpha = client(env.base);
+  await alpha.login('alpha@example.org', PASS);
+  const created = await alpha.request('/api/campaigns', { method: 'POST', body: { draft: true, channel: 'email', name: '' } });
+  assert.equal(created.status, 201);
+  const id = created.data.campaign.id;
+  const patched = await alpha.request(`/api/campaigns/${id}`, { method: 'PATCH', body: { name: 'Autosaved', subject: 'Hi', body_html: '<p>Body <script>x()</script></p>' } });
+  assert.equal(patched.status, 200);
+  assert.doesNotMatch(patched.data.campaign.body_html, /script/);
+  const future = new Date(Date.now() + 3600e3).toISOString();
+  assert.equal((await alpha.request(`/api/campaigns/${id}/schedule`, { method: 'POST', body: { scheduled_at: future } })).status, 200);
+  assert.equal((await alpha.request(`/api/campaigns/${id}`, { method: 'PATCH', body: { name: 'late edit' } })).status, 409);
+  const orient = client(env.base);
+  await orient.login('orient@example.org', PASS);
+  const betaDraft = await orient.request('/api/campaigns', { method: 'POST', body: { draft: true, valley_id: env.valleyB, channel: 'sms', name: 'beta draft' } });
+  assert.equal((await alpha.request(`/api/campaigns/${betaDraft.data.campaign.id}`, { method: 'PATCH', body: { name: 'x' } })).status, 404);
+});
+
+// Last on purpose: it exhausts the login limiter for the shared test IP.
+test('login rate limit blocks after repeated failures', async () => {
+  const c = client(env.base);
+  let last;
+  for (let i = 0; i < 11; i++) last = await c.login('nobody@example.org', 'whatever-password');
+  assert.equal(last.status, 429);
+});
